@@ -1,0 +1,736 @@
+package com.easemob.weichat.service.impl;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+import com.easemob.weichat.models.data.*;
+import com.easemob.weichat.models.entity.*;
+import com.easemob.weichat.models.enums.AppealStatus;
+import com.easemob.weichat.models.utils.DayUtil;
+import com.easemob.weichat.persistence.jpa.QualityAppealRepository;
+import com.easemob.weichat.persistence.specifications.QualityAppealSpecifications;
+import com.easemob.weichat.service.*;
+import com.easemob.weichat.service.feign.IWebappReadonlyClient;
+import com.easemob.weichat.service.util.ThreadContextUtil;
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Component;
+
+import com.easemob.weichat.exception.QualityReviewException;
+import com.easemob.weichat.persistence.jpa.QualityFileReposity;
+import com.easemob.weichat.persistence.jpa.QualityResultRepository;
+import com.easemob.weichat.persistence.jpa.QualityReviewRepository;
+import com.easemob.weichat.service.events.QualityReviewCreateEvent;
+import com.easemob.weichat.service.events.QualityReviewUpdateEvent;
+import com.easemob.weichat.service.util.NumberUtil;
+
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * 质检服务
+ * 
+ * @author lcx
+ * @date 2016年3月28日 下午8:55:05
+ */
+@Slf4j
+@Component
+public class QualityReviewService implements IQualityReviewService {
+
+    public static final String INVITE_WAY_AGENT = "agent";
+
+    private static final String RESOLVE = "已解决";
+
+    private static final String NOT_RESOLVE = "未解决";
+
+    private static final String OPTION_ENQUIRY_SHARE_ENABLE = "EnquiryShareEnable";
+
+	@Autowired
+	private QualityReviewRepository qualityReviewReposity;
+
+	@Autowired
+	private QualityResultRepository resultRepository;
+	
+	@Autowired
+    private QualityFileReposity qualityFileReposity;
+	
+	@Autowired
+	private IQualityReviewRemoteService qualityReviewRemoteService;
+
+	@Autowired
+	private IQualityItemService itemService;
+	
+	@Autowired
+	private IQualityScoreMappingService scoreMappingService;
+	
+	@Autowired
+	private ApplicationEventPublisher eventPublisher;
+	
+	@Autowired
+	private IWebappReadonlyClient feignClient;
+	
+	@Autowired
+	private IAgentManager agentManager;
+	
+	@Autowired
+	private IQualityTaskService taskService;
+	
+	@Autowired
+	private IQualityAppealService appealService;
+
+	@Autowired
+    private QualityAppealRepository appealRepository;
+
+	@Autowired
+    private IEnquiryService enquiryService;
+
+    @Autowired
+    private IOptionsManager optionsManager;
+
+	@Value("${service.client.robot.sentiment.enable}")
+    private boolean sentimentEnable;
+
+    private List<String> sessionIds = null;
+
+    private List<SentimentResult> sentimentResults = null;
+
+	@Override
+	public QualityReview createOrUpdateQualityReview(QualityReview qualityReview) {
+		if (qualityReview.getTenantId() == null || qualityReview.getServiceSessionId() == null || qualityReview.getStepId() == null) {
+			throw new IllegalArgumentException("teanatId or serviceSessionId or stepId is null");
+		}
+		Integer tenantId = qualityReview.getTenantId();
+		
+		checkTaskId(qualityReview);
+		setScoresAndQualityResults(tenantId, qualityReview);
+		QualityReview findedStep=qualityReviewReposity.findFirstByTenantIdAndServiceSessionIdAndStepId(qualityReview.getTenantId(), qualityReview.getServiceSessionId(),qualityReview.getStepId());
+		if(findedStep!=null){
+            checkAppealStatus(findedStep);
+            boolean taskIdChanged = false;
+            if (StringUtils.isNotBlank(qualityReview.getTaskId()) && !StringUtils.equals(qualityReview.getTaskId(), findedStep.getTaskId())) {
+                findedStep.setTaskId(qualityReview.getTaskId());
+                taskIdChanged = true;
+            }
+            findedStep.setReviewerId(qualityReview.getReviewerId());
+			findedStep.setComment(qualityReview.getComment());
+			findedStep.setScore(qualityReview.getScore());
+			findedStep.setTotalScore(qualityReview.getTotalScore());
+			findedStep.setAgentId(qualityReview.getAgentId());
+			findedStep.setAgentName(qualityReview.getAgentName());
+			findedStep.setStepId(qualityReview.getStepId());
+			findedStep.setQualityResults(qualityReview.getQualityResults());
+			findedStep.setLastModifyDateTime(new Date());
+			qualityReviewReposity.saveAndFlush(findedStep);
+			int deletedRaws = resultRepository.deleteByTenantIdAndReviewId(tenantId, findedStep.getId());
+			findedStep.setAttachments(qualityReview.getAttachments());
+			updateQualityFiles(findedStep);
+			//重新获得附件
+			findedStep.setAttachments(qualityFileReposity.findByTenantIdAndReviewIdOrderByCreateDateTimeAsc(findedStep.getTenantId(), findedStep.getId()));
+			log.info("tenant {} before update qualityreview for session {} step {}, delete {} raws old data.", tenantId, qualityReview.getServiceSessionId(), qualityReview.getStepId(), deletedRaws);
+			saveQualityResults(findedStep);
+			eventPublisher.publishEvent(new QualityReviewUpdateEvent(findedStep, taskIdChanged));
+			return findedStep;
+		}else{
+			qualityReviewReposity.saveAndFlush(qualityReview);
+			saveQualityResults(qualityReview);
+			updateQualityFiles(qualityReview);
+			qualityReview.setAttachments(qualityFileReposity.findByTenantIdAndReviewIdOrderByCreateDateTimeAsc(qualityReview.getTenantId(), qualityReview.getId()));
+			eventPublisher.publishEvent(new QualityReviewCreateEvent(qualityReview));
+			return qualityReview;
+		}
+	}
+
+    private void checkAppealStatus(QualityReview qualityReview) {
+        QualityAppealQuery query = new QualityAppealQuery();
+        // 目前是不允许同时提交多条申诉，也就是Processing或者Wait状态的只会有一条，并且使用默认时间排序的话，会是第一条
+        // 因此设置分页大小为5就足够了
+        query.setTenantId(qualityReview.getTenantId());
+        query.setReviewId(qualityReview.getId());
+        query.setStatus(Arrays.asList(AppealStatus.Wait, AppealStatus.Processing, AppealStatus.Terminal));
+        Page<QualityAppeal> qualityAppeals = appealRepository.findAll(QualityAppealSpecifications.getWhereClause(query),
+                new PageRequest(0, 10, new Sort(Sort.Direction.DESC, "createAt")));
+        if (qualityAppeals.getTotalElements() > 0) {
+            // 有非拒绝的申诉记录，需要进行判断
+
+            List<QualityAppeal> appeals = qualityAppeals.getContent();
+
+            if (appeals.stream().anyMatch(appeal -> appeal.getStatus() == AppealStatus.Wait)) {
+                // 有管理员Wait的申诉，暂时不允许更新质检信息
+                throw new QualityReviewException(QualityErrorDefinition.QUALITY_REVIEW_UPDATE_EXIST_WAIT_APPEAL, HttpStatus.BAD_REQUEST);
+            }
+
+            List<QualityAppeal> processingAppeals = appeals.stream()
+                    .filter(appeal -> appeal.getStatus() == AppealStatus.Processing)
+                    .collect(Collectors.toList());
+            if (CollectionUtils.isNotEmpty(processingAppeals)) {
+                BaseUser currentUser = ThreadContextUtil.getUser();
+                if (processingAppeals.stream().noneMatch(appeal -> StringUtils.equals(appeal.getAssigneeId(), currentUser == null ? null : currentUser.getUserId()))) {
+                    // 有Processing中的申诉，非处理人不允许修改申诉
+                    throw new QualityReviewException(QualityErrorDefinition.QUALITY_REVIEW_UPDATE_EXIST_PROCESSING_APPEAL, HttpStatus.BAD_REQUEST);
+                } else {
+                    // 有Processing中的申诉，并且是处理人，符合条件
+                    return;
+                }
+            }
+
+            // 没有Wait，也没有Processing，说明有Terminal状态的申诉，也不允许修改
+            throw new QualityReviewException(QualityErrorDefinition.QUALITY_REVIEW_UPDATE_EXIST_TERMINAL_APPEAL, HttpStatus.BAD_REQUEST);
+        }
+    }
+
+    private void checkTaskId(QualityReview qualityReview) {
+        if (qualityReview.getTaskId() != null) {
+            QualityTask task = taskService.getOne(qualityReview.getTaskId());
+            if (task == null || task.getTenantId().compareTo(qualityReview.getTenantId()) != 0) {
+                throw new QualityReviewException(
+                        QualityErrorDefinition.QUALITY_TASK_TASKID_NOT_EXIST, HttpStatus.BAD_REQUEST);
+            }
+        }
+    }
+
+    private void updateQualityFiles(QualityReview qualityReview) {
+        List<QualityFile> qualityFiles = qualityReview.getAttachments();
+        List<QualityFile> oldQualityFiles = qualityFileReposity.findByTenantIdAndReviewIdOrderByCreateDateTimeAsc(qualityReview.getTenantId(), qualityReview.getId());
+        if (qualityFiles == null || qualityFiles.isEmpty()) {
+            qualityFileReposity.deleteInBatch(oldQualityFiles);
+            return;
+        }
+        // 添加新的
+        qualityFiles.stream()
+                .filter(qualityFile -> !oldQualityFiles.stream().anyMatch(oldQualityFile -> oldQualityFile.getUuid().equals(qualityFile.getUuid())))
+                .forEach(qualityFile -> {
+                    qualityFile.setTenantId(qualityReview.getTenantId());
+                    qualityFile.setReviewId(qualityReview.getId());
+                    qualityFileReposity.saveAndFlush(qualityFile);
+                    log.info("qualityFile {}", qualityFile);
+                });
+        // 删除旧的
+        qualityFileReposity.deleteInBatch(oldQualityFiles.stream()
+                .filter(oldQualityFile -> !qualityFiles.stream().anyMatch(qualityFile -> qualityFile.getUuid().equals(oldQualityFile.getUuid())))
+                .collect(Collectors.toList()));
+    }
+
+    private void saveQualityResults(QualityReview qualityReview) {
+        List<QualityResult> qualityResults = qualityReview.getQualityResults();
+        if (!CollectionUtils.isEmpty(qualityResults)) {
+            for (QualityResult result : qualityResults) {
+                result.setReviewId(qualityReview.getId());
+            }
+            resultRepository.save(qualityResults);
+            log.info("tenant {} success to save qualityresults for reivewId {}, results {}.", qualityReview.getTenantId(), qualityReview.getId(), qualityResults);
+        }
+    }
+
+    private void setScoresAndQualityResults(Integer tenantId,
+            QualityReview qualityReview) {
+        if (!CollectionUtils.isEmpty(qualityReview.getQualityResults())) {
+            log.info("tenant {} will make qualityreview with qualityitems, request itemresults: {}.", tenantId, qualityReview.getQualityResults());
+            List<QualityItem> qualityItems = itemService.getQualityItems(tenantId);
+            List<QualityResult> requestResults = qualityReview.getQualityResults();
+            checkRequestResult(qualityItems, requestResults);
+            
+            List<QualityResult> builtResults = buildQualityResults(requestResults, qualityItems);
+            qualityReview.setQualityResults(builtResults);
+            
+            Double totalScore = getTotalScore(builtResults);
+            qualityReview.setTotalScore(totalScore);
+            qualityReview.setScore(getStandardScore(tenantId, totalScore));
+        } else {
+            // 如果传入的评分项评分信息是空的，就使用旧模式，此时如果score没有传或者小于0或者大于5，则说明传入参数有问题
+            log.info("tenant {} will make qualityreview without qualityitems, request score: {}.", tenantId, qualityReview.getScore());
+            QualityReviewException.throwQualityReviewExceptionOnCondition(
+                    qualityReview.getScore() == null || qualityReview.getScore() < 0 || qualityReview.getScore() > 5,
+                    QualityErrorDefinition.QUALITYREVIEW_REQUEST_SCORE_ERROR,
+                    HttpStatus.BAD_REQUEST);
+            
+            QualityItem defualtQualityItem = itemService.getDefualtQualityItem(tenantId);
+            QualityResult result = new QualityResult(defualtQualityItem, qualityReview.getScore().doubleValue());
+            qualityReview.setQualityResults(Collections.singletonList(result));
+            qualityReview.setTotalScore(qualityReview.getScore().doubleValue());
+        }
+        
+    }
+
+    private Double getTotalScore(List<QualityResult> builtResults) {
+        return builtResults.stream().map(result -> {
+            if (StringUtils.equals(Operation.ADD.getName(), result.getOpt())) {
+                return result.getScore();
+            } else {
+                return -result.getScore();
+            }
+        }).reduce(NumberUtil::add).orElse(0d);
+    }
+
+    private List<QualityResult> buildQualityResults(List<QualityResult> requestResults,
+            List<QualityItem> qualityItems) {
+        return qualityItems.stream().map(item -> {
+            Double score = 0d;
+            Optional<QualityResult> findAny = requestResults.stream()
+                    .filter(result -> result.getItemId().intValue() == item.getId().intValue()).findAny();
+            if (findAny.isPresent()) {
+                score = findAny.get().getScore();
+            }
+            return new QualityResult(item, score);
+        }).collect(Collectors.toList());
+    }
+
+    /**
+     * 验证请求的评分信息是否正确
+     *      需要验证：1.itemId必须在数据库中存在
+     *              2.分数必须小于等于满分
+     * @param qualityItems
+     * @param requestResults
+     */
+    private void checkRequestResult(List<QualityItem> qualityItems,
+            List<QualityResult> requestResults) {
+        boolean allMatch = requestResults.stream().allMatch(result -> {
+            // temId或score是空
+            if (result.getItemId() != null && result.getScore() != null && result.getScore() >= 0) {
+                // 任何一个分数大于满分的
+                return qualityItems.stream().anyMatch(item -> {
+                    if (item.getId().intValue() == result.getItemId().intValue()) {
+                        return NumberUtil.compareTo(result.getScore(), item.getFullmark()) <= 0;
+                    }
+                    return false;
+                });
+            }
+            return false;
+        });
+        QualityReviewException.throwQualityReviewExceptionOnCondition(
+                !allMatch,
+                QualityErrorDefinition.QUALITYREVIEW_REQUEST_RESULT_ERROR,
+                HttpStatus.BAD_REQUEST);
+    }
+
+    private Integer getStandardScore(Integer tenantId, Double totalScore) {
+        List<QualityScoreMapping> mappings = scoreMappingService.findByTenantId(tenantId);
+        for (QualityScoreMapping mapping : mappings) {
+            if (mapping.getMaxScore() != null && totalScore <= mapping.getMaxScore()) {
+                return mapping.getStandardScore();
+            }
+        }
+        return mappings.get(mappings.size() - 1).getStandardScore();
+    }
+
+    @Override
+	public QualityReview findQualityReviewByStepId(int tenantId, String serviceSessionId, Integer stepId, boolean includeAttachements) {
+		QualityReview review = qualityReviewReposity.findFirstByTenantIdAndServiceSessionIdAndStepId(tenantId, serviceSessionId, stepId);
+		if(review!=null){
+		    List<QualityResult> results = resultRepository.findByTenantIdAndReviewId(tenantId, review.getId());
+		    review.setQualityResults(results);
+		    if(includeAttachements){
+		        review.setAttachments(qualityFileReposity.findByTenantIdAndReviewIdOrderByCreateDateTimeAsc(review.getTenantId(), review.getId()));
+		    }
+		    // 添加质检记录对应的申诉信息
+		    QualityAppealQuery appealQuery = new QualityAppealQuery();
+            appealQuery.setSize(100);
+		    appealQuery.setTenantId(tenantId);
+		    appealQuery.setReviewId(review.getId());
+		    Page<QualityAppeal> pageAppeals = appealService.pageAppeals(tenantId, appealQuery, false);
+		    review.setAppeals(pageAppeals.getContent());
+		}
+		return review;
+	}
+	
+	@Override
+	public ServiceSessionQualityResult findQualityReviewsByServiceSessionId(int tenantId, String serviceSessionId, String agentId, Boolean withReviewerName) {
+		
+        int actualPageSize;
+        int pageNumber = 0;
+        int pageSize = 50;
+        String status = ServiceSessionQualityResult.STATUS_OK;
+        List<ServiceSessionQualityReview> sessions = new ArrayList<>();
+        ServiceSessionQualityResult result = new ServiceSessionQualityResult();
+//        do {
+//            ServiceSessionQualityResult statisticResults =
+//                    qualityReviewRemoteService.queryByServiceSessionIdFromStatistic(
+//                            serviceSessionId, tenantId, pageNumber, pageSize);
+//            if (statisticResults != null
+//                    && ServiceSessionQualityResult.STATUS_OK.equals(statisticResults.getStatus())) {
+//                sessions.addAll(statisticResults.getEntities());
+//                actualPageSize = statisticResults.getEntities().size();
+//                pageNumber++;
+//            } else {
+//                actualPageSize = 0;
+//                status = ServiceSessionQualityResult.STATUS_FAIL;
+//            }
+//        } while (actualPageSize == pageSize);
+        ServiceSessionQualityReview review1 = new ServiceSessionQualityReview();
+        review1.setServiceSessionId("5ad1bfed-f77e-4382-a48b-f7204f0e4ea8");
+        review1.setAgentId("f9da2fa4-6384-458c-a396-30e00f9f68a3");
+        sessions.add(review1);
+
+        ServiceSessionQualityReview review2 = new ServiceSessionQualityReview();
+        review2.setServiceSessionId("5ad1bfed-f77e-4382-a48b-f7204f0e4ea8");
+        review2.setAgentId("38041d4b-332f-4834-806a-568c713ed8d7");
+        sessions.add(review2);
+
+        if (!CollectionUtils.isEmpty(sessions)) {
+            List<ServiceSessionQualityReview> correctSessions =
+                    getCorrectSessions(tenantId, serviceSessionId, agentId, sessions, withReviewerName);
+            appendEnquiryMessageToSessions(tenantId, correctSessions);
+            result.setEntities(correctSessions);
+            result.setTotalElements(Long.valueOf(correctSessions.size()));
+        }else{
+            result.setEntities(sessions);
+            result.setTotalElements(Long.valueOf(0));
+        }
+        result.setStatus(status);
+        return result;
+	}
+
+    @Override
+    public ServiceSessionQualityDetailsResult findQualityReviewsDetailsByServiceSessionId(int tenantId, String serviceSessionId) {
+        return qualityReviewRemoteService.queryDetailsByServiceSessionIdFromStatistic(serviceSessionId, tenantId);
+    }
+
+
+        /**
+         * 获取适合的session信息
+         * 如果agentId不为空，只返回该agent的信息
+         * 如果withReviewerName为true，需要为质检信息设置质检员昵称
+         * @param tenantId
+         * @param serviceSessionId
+         * @param agentId
+         * @param sessions
+         * @param withReviewerName
+         * @return
+         */
+    private List<ServiceSessionQualityReview> getCorrectSessions(int tenantId,
+            String serviceSessionId, String agentId, List<ServiceSessionQualityReview> sessions, Boolean withReviewerName) {
+        List<ServiceSessionQualityReview> correctSessions = sessions.stream()
+                .filter(session -> StringUtils.isBlank(agentId)
+                        || StringUtils.equals(agentId, session.getAgentId()))
+                .map(session->{
+                    session.setServiceSessionId(serviceSessionId);
+                    session.setTaskId(session.getBatchId());
+                    if (session.getVisitorMark() != null && session.getVisitorMark() > 0) {
+                        session.setEnquirySummary(session.getVisitorMark() + "");
+                        session.setVisitorMark(null);
+                    } else {
+                        session.setEnquirySummary("");
+                    }
+                    return session;
+                })
+                .collect(Collectors.toList());
+        
+        if(CollectionUtils.isNotEmpty(correctSessions)){
+            appendQualityReviewForSessions(tenantId, withReviewerName, correctSessions);
+        }
+        return correctSessions;
+    }
+
+    private void appendReviewerNameForQualityReviews(int tenantId,
+            List<QualityReview> qualityReviews) {
+        List<String> agentIds = qualityReviews.stream()
+                .filter(qualityReview -> StringUtils.isNotBlank(qualityReview.getReviewerId()))
+                .map(QualityReview::getReviewerId).distinct()
+                .collect(Collectors.toList());
+        
+        if(CollectionUtils.isEmpty(agentIds)){
+            return;
+        }
+
+        List<AgentUser> agents = agentManager.getAgentsByAgentIds(tenantId, agentIds);
+        Map<String, List<AgentUser>> agentMap =
+                agents.stream().filter(agent -> StringUtils.isNotBlank(agent.getUserId()))
+                        .collect(Collectors.groupingBy(AgentUser::getUserId));
+        
+        for(QualityReview qualityReview:qualityReviews){
+            if(StringUtils.isNotBlank(qualityReview.getReviewerId())){
+                String reviewerId = qualityReview.getReviewerId();
+                if(agentMap.containsKey(reviewerId)){
+                    qualityReview.setReviewerName(agentMap.get(reviewerId).get(0).getNicename());
+                }else{
+                    log.warn(
+                            "can not found review for qualityId:{} from webapp by tenantId:{}, agentId:{}.",
+                            qualityReview.getId(), tenantId, reviewerId);
+                }
+            }
+        }
+        
+        
+    }
+
+    @Override
+	public ServiceSessionQualityResult findQualityReviews(QualityReviewQuery query) {
+
+        ServiceSessionQualityResult responseResults = new ServiceSessionQualityResult();
+
+        if(StringUtils.isNotBlank(query.getServiceSessionId())){
+
+            query.setBeginTime(DayUtil.getTimesBreforeMonthmorning());
+            query.setEndTime(DayUtil.getTimesMonthight());
+            ServiceSessionQualityResult ssqr=choiceFindQualityReviews(query);
+            List<ServiceSessionQualityReview> entities =ssqr.getEntities();
+
+            log.info("ServiceSessionQualityReview list is {} ",entities.toString());
+
+            List<ServiceSessionQualityReview> entity= entities.stream().filter(s ->s.getSessionId().equals(query.getServiceSessionId())).collect(Collectors.toList());
+            if(! entity.isEmpty() &&  entity.size() > 0){
+            responseResults.setTotalElements((long)entity.size());
+            responseResults.setEntities(entity);
+            responseResults.setStatus(ssqr.getStatus());
+                return responseResults;
+        } else {
+            responseResults.setStatus(ServiceSessionQualityResult.STATUS_FAIL);
+            responseResults.setTotalElements(0L);
+            responseResults.setEntities(null);
+            return responseResults;
+        }
+        } else{
+            return choiceFindQualityReviews(query);
+        }
+	}
+
+
+	private  ServiceSessionQualityResult  choiceFindQualityReviews(QualityReviewQuery query){
+        {
+
+            ServiceSessionQualityResult responseResults = new ServiceSessionQualityResult();
+            List<ServiceSessionQualityReview> entities = new ArrayList<>();
+            ServiceSessionQualityResult statisticResults= null;
+
+            if(StringUtils.isNotBlank(query.getServiceSessionId())){
+                statisticResults = qualityReviewRemoteService
+                        .queryByServiceSessionIdFromStatistic(query.getServiceSessionId(),query.getTenantId(),query.getPage(),query.getPageSize());
+            }else{
+                statisticResults = qualityReviewRemoteService
+                        .queryServiceSessionFromStatistic(query);
+            }
+
+            if (statisticResults != null && ServiceSessionQualityResult.STATUS_OK.equals(statisticResults.getStatus())) {
+
+                final boolean containSentiment = sentimentEnable && query.getHasSentiment() != null && query.getHasSentiment();
+                getSentimentResults(query, statisticResults, containSentiment);
+
+                List<String> agentIds = statisticResults.getEntities().stream()
+                        .filter(statisticResult -> StringUtils.isNotBlank(statisticResult.getAgentId()))
+                        .map(ServiceSessionQualityReview::getAgentId).distinct()
+                        .collect(Collectors.toList());
+                List<AgentUser> agents = agentManager.getAgentsByAgentIds(query.getTenantId(), agentIds);
+                Map<String, AgentUser> agentsMap = agents.stream().filter(agent -> StringUtils.isNotBlank(agent.getUserId())).collect(Collectors.toMap(AgentUser::getUserId, agentUser -> agentUser));
+
+                for (ServiceSessionQualityReview statisticResult : statisticResults.getEntities()) {
+                    ServiceSessionQualityReview sessionQualityReview = qualityReviewRemoteService
+                            .queryServiceSessionFromHistory(query.getTenantId(), statisticResult.getSessionId());
+                    sessionQualityReview = mergeSesionData(sessionQualityReview, statisticResult, agentsMap.get(statisticResult.getAgentId()));
+                    if (containSentiment) {
+                        SentimentResult sentimentResult = getSentimentResult(statisticResult.getSessionId());
+                        sessionQualityReview.setSentimentResult(sentimentResult);
+                    }
+                    entities.add(sessionQualityReview);
+                }
+
+                appendQualityReviewForSessions(query.getTenantId(), query.getWithReviewerName(), entities);
+
+                appendEnquiryMessageToSessions(query.getTenantId(), entities);
+
+                appendIsAgentInviteForSessions(query.getTenantId(), entities);
+
+                responseResults.setStatus(statisticResults.getStatus());
+                responseResults.setTotalElements(statisticResults.getTotalElements());
+                responseResults.setEntities(entities);
+                return responseResults;
+            } else {
+                responseResults.setStatus(ServiceSessionQualityResult.STATUS_FAIL);
+                responseResults.setTotalElements(0L);
+                responseResults.setEntities(null);
+                return responseResults;
+            }
+        }
+    }
+
+    @Override
+    public void appendIsAgentInviteForSessions(Integer tenantId, List<ServiceSessionQualityReview> sessions) {
+        if (CollectionUtils.isNotEmpty(sessions)) {
+            List<String> serviceSessionIdList = sessions.stream().map(ServiceSessionQualityReview::getServiceSessionId).
+                    filter(StringUtils::isNotBlank).collect(Collectors.toList());
+            if (CollectionUtils.isEmpty(serviceSessionIdList)) {
+                return;
+            }
+            List<InviteEnquiry> inviteEnquiryList = enquiryService.findInviteEnquiryBySessionIds(tenantId, serviceSessionIdList);
+            if (CollectionUtils.isEmpty(inviteEnquiryList)) {
+                return;
+            }
+            Map<String, InviteEnquiry> inviteEnquiryMap = inviteEnquiryList.stream().collect(Collectors.toMap(InviteEnquiry::getServiceSessionId, InviteEnquiry -> InviteEnquiry));
+            sessions.stream().forEach(session -> {
+                InviteEnquiry inviteEnquiry = inviteEnquiryMap.get(session.getServiceSessionId());
+                if (inviteEnquiry == null) {
+                    session.setInvited(false);
+                } else {
+                    session.setInvited(StringUtils.equals(INVITE_WAY_AGENT, inviteEnquiry.getInviteWay()));
+                }
+            });
+        }
+    }
+
+    private void appendEnquiryMessageToSessions(Integer tenantId, List<ServiceSessionQualityReview> sessions) {
+        if (CollectionUtils.isEmpty(sessions)) {
+            return;
+        }
+//        String optionValue = optionsManager.getOptionValue(tenantId, OPTION_ENQUIRY_SHARE_ENABLE);
+        String optionValue = "true";
+        Boolean isEnquiryShareEnable = false;
+        if (StringUtils.isNotBlank(optionValue)) {
+            isEnquiryShareEnable = Boolean.parseBoolean(optionValue);
+        }
+        Map<String, Enquiry> enquiryMap = new HashMap<>();
+        Map<String, Resolution> resolutionMap = new HashMap<>();
+        for (ServiceSessionQualityReview session : sessions) {
+            Enquiry enquiry = null;
+            if (enquiryMap.containsKey(session.getServiceSessionId())) {
+                enquiry = enquiryMap.get(session.getServiceSessionId());
+            } else {
+                enquiry = enquiryService.findByTenantIdAndServiceSessionId(tenantId, session.getServiceSessionId());
+                enquiryMap.put(session.getServiceSessionId(), enquiry);
+            }
+            // 如果满意度共享开关关闭,那么满意度数据只添加给对应的坐席
+            if ((!isEnquiryShareEnable) && (!StringUtils.equals(session.getAgentId(), enquiry.getAgentUserId()))) {
+                continue;
+            }
+            if (enquiry != null) {
+                // 质检添加评价标签
+                List<EnquiryTag> enquiryTags = enquiry.getEnquiryTags();
+                Set<String> tagSet = new HashSet<>();
+                if (!CollectionUtils.isEmpty(enquiryTags)) {
+                    enquiryTags.stream().forEach(tag -> {
+                        tagSet.add(tag.getTagName());
+                    });
+                    session.setEnquiryTagName(StringUtils.join(tagSet, ","));
+                }
+                // 质检添加评价内容
+                EnquiryDegree degree = enquiry.getDegree();
+                if (degree != null) {
+                    session.setEnquiryDetail(enquiry.getDetail());
+                }
+            }
+            // 质检添加是否解决
+            Resolution resolution = null;
+            if (resolutionMap.containsKey(session.getServiceSessionId())) {
+                resolution = resolutionMap.get(session.getServiceSessionId());
+            } else {
+                resolution = enquiryService.findResolutionByTenantIdAndSessionId(tenantId, session.getServiceSessionId());
+                resolutionMap.put(session.getServiceSessionId(), resolution);
+            }
+            if (resolution != null) {
+                session.setResolution(resolution.getResolutionParamScore() == 1 ? RESOLVE : NOT_RESOLVE);
+            }
+        }
+    }
+
+    private void appendQualityReviewForSessions(Integer tenantId, Boolean withReviewerName,
+            List<ServiceSessionQualityReview> sessions) {
+        if (CollectionUtils.isNotEmpty(sessions)) {
+            List<String> serviceSessionIds = sessions.stream().map(ServiceSessionQualityReview::getServiceSessionId).filter(StringUtils::isNotBlank)
+                    .collect(Collectors.toList());
+            List<Integer> stepIds = sessions.stream().map(ServiceSessionQualityReview::getStepId).filter(stepId->stepId!=null)
+                    .collect(Collectors.toList());
+            
+            if (CollectionUtils.isEmpty(serviceSessionIds) || CollectionUtils.isEmpty(stepIds)) {
+                return;
+            }
+            
+            List<QualityReview> qualityReviews =
+                    qualityReviewReposity.findByTenantIdAndServiceSessionIdInAndStepIdIn(tenantId, serviceSessionIds, stepIds);
+
+            if (withReviewerName) {
+                appendReviewerNameForQualityReviews(tenantId, qualityReviews);
+            }
+            for (ServiceSessionQualityReview session : sessions) {
+                qualityReviews.stream()
+                        .filter(review -> session.getStepId() != null && review.getStepId() != null
+                                && StringUtils.equals(session.getServiceSessionId(),
+                                        review.getServiceSessionId())
+                                && session.getStepId().intValue() == review.getStepId().intValue())
+                        .findFirst().ifPresent(session::setQualityReview);
+            }
+        }
+    }
+
+    private ServiceSessionQualityReview mergeSesionData(ServiceSessionQualityReview sessionQualityReview,
+            ServiceSessionQualityReview statisticResult,AgentUser agentUser) {
+        if (sessionQualityReview == null) {
+            if (statisticResult == null) {
+                return new ServiceSessionQualityReview();
+            }
+            return statisticResult;
+        }
+        sessionQualityReview.setSessionId(statisticResult.getSessionId());
+        sessionQualityReview.setServiceSessionId(statisticResult.getSessionId());
+        sessionQualityReview.setAvgResTime(statisticResult.getAvgResTime());
+        sessionQualityReview.setFirstResTime(statisticResult.getFirstResTime());
+        sessionQualityReview.setWorkTime(statisticResult.getWorkTime());
+        sessionQualityReview.setAgentId(statisticResult.getAgentId());
+        sessionQualityReview.setAgentName(statisticResult.getAgentName());
+        sessionQualityReview.setVisitCount(statisticResult.getVisitCount());
+        sessionQualityReview.setStepId(statisticResult.getStepId());
+        sessionQualityReview.setAmsgCount(statisticResult.getAmsgCount());
+        sessionQualityReview.setVmsgCount(statisticResult.getVmsgCount());
+        sessionQualityReview.setQualityTime(statisticResult.getQualityTime());
+        sessionQualityReview
+                .setAgentUserName(agentUser!= null ? agentUser.getUsername() : "");
+        sessionQualityReview
+                .setAgentTrueName(agentUser!= null ? agentUser.getTrueName() : "");
+        sessionQualityReview.setTaskId(statisticResult.getBatchId());
+        sessionQualityReview.setMaxResTime(statisticResult.getMaxResTime());
+
+        // 满意度评价为服务所有，因此如果统计有满意度分数，则使用统计返回的分数，没有的话，设置满意度评价结果为空
+        if (statisticResult.getVisitorMark() != null && statisticResult.getVisitorMark() > 0) {
+            sessionQualityReview.setEnquirySummary(statisticResult.getVisitorMark() + "");
+        }else{
+            sessionQualityReview.setEnquirySummary("");
+            sessionQualityReview.setEnquiryDetail("");
+        }
+        
+        if (statisticResult.getResponseTime() != null) {
+            sessionQualityReview.setResponseTime(statisticResult.getResponseTime().stream()
+                    .sorted((time1, time2) -> -time1.compareTo(time2))
+                    .collect(Collectors.toList()));
+            sessionQualityReview.setResponseTimeSize(statisticResult.getResponseTime().size());
+        }
+        return sessionQualityReview;
+    }
+
+    /**
+     * @param query
+     * @param statisticResults
+     * @param containSentiment
+     */
+    private void getSentimentResults(QualityReviewQuery query,
+            ServiceSessionQualityResult statisticResults, final boolean containSentiment) {
+        if(containSentiment){
+            sessionIds = new ArrayList<>();
+            for (ServiceSessionQualityReview statisticResult : statisticResults.getEntities()) {
+                sessionIds.add(statisticResult.getSessionId());
+            }
+            sentimentResults = getBatchSentiment(query.getTenantId(), sessionIds);
+        }
+    }
+
+    private SentimentResult getSentimentResult(String sessionId) {
+        if(sessionIds == null || sentimentResults == null){
+            return null;
+        }
+        int index = sessionIds.indexOf(sessionId);
+        if(index != -1 && sentimentResults.size() > index){
+            return sentimentResults.get(index);
+        }
+        return null;
+    }
+
+    public List<SentimentResult> getBatchSentiment(Integer tenantId, List<String> sessionIds) {
+       ApiResponse2<SentimentResult> apiResponse = feignClient.batchCheckSentimentWithExplanation(tenantId, sessionIds);
+       if(apiResponse == null || ApiResponse2.STATUS_FAIL.equals(apiResponse.getStatus())){
+           return Collections.emptyList();
+       }
+       return apiResponse.getEntities();
+    }
+
+}
